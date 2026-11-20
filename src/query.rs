@@ -345,7 +345,17 @@ pub fn build(f: &Fields, p: &Parsed, mode: Mode) -> Option<Box<dyn Query>> {
         must.push((Occur::Must, Box::new(RangeQuery::new(lo, hi))));
     }
     if !any_text {
-        return None;
+        // Only filters (`from:me session:<id>`: every prompt in a session):
+        // everything they let through. Nothing at all asks for nothing.
+        let filtered = p.role.is_some()
+            || p.session.is_some()
+            || !p.places.is_empty()
+            || p.after.is_some()
+            || p.before.is_some();
+        if !filtered {
+            return None;
+        }
+        must.push((Occur::Must, Box::new(tantivy::query::AllQuery)));
     }
     Some(Box::new(BooleanQuery::new(must)))
 }
@@ -839,6 +849,29 @@ mod tests {
         assert_eq!(sessions, vec!["s2", "s1"], "s2's messages are newer");
         let ts: Vec<i64> = b.sessions[1].hits.iter().map(|h| h.ts).collect();
         assert!(ts.windows(2).all(|w| w[0] >= w[1]), "{ts:?}");
+    }
+
+    #[test]
+    fn filters_alone_list_what_they_let_through() {
+        let a = search_index(
+            &sample(),
+            &Ask {
+                q: "from:me session:s1",
+                now: NOW,
+                sessions: 1,
+                per_session: 1,
+                in_order: Some(100),
+                pool: POOL,
+                recent: false,
+            },
+            false,
+        )
+        .unwrap();
+        let hits = &a.sessions[0].hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, "user");
+        assert!(hits[0].snippet.starts_with("Why does the hook"));
+        assert!(ask("   ").sessions.is_empty());
     }
 
     #[test]
