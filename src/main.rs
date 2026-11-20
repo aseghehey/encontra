@@ -1,9 +1,10 @@
 //! herdr-search: full-text search over Claude Code session logs, for herdr-chat.
 //!
 //!   herdr-search index [--root DIR] [--index DIR] [--subagents] [--threads N] [--budget SECS]
-//!   herdr-search query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] [--update] <query>
+//!   herdr-search query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] [--recent] [--update] <query>
 //!   herdr-search sessions [--index DIR] [--limit N] [--filter TEXT] [--update]
-//!   herdr-search page --file LOG [--from OFFSET] [--to OFFSET]
+//!   herdr-search page --file LOG [--from OFFSET | --tail BYTES] [--to OFFSET]
+//!   herdr-search follow --file LOG --from OFFSET [--wait SECS]   (new lines, as soon as they're written)
 //!   herdr-search rename --file LOG --session ID --name NAME   (a session that isn't running)
 //!   herdr-search stats [--index DIR]
 //!
@@ -113,7 +114,7 @@ fn update_quietly(root: &Path, index_dir: &Path) {
 fn run() -> Result<()> {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
-        bail!("usage: herdr-search index|query|sessions|page|rename|stats [options]");
+        bail!("usage: herdr-search index|query|sessions|page|follow|rename|stats [options]");
     }
     let cmd = all.remove(0);
     let mut a = Args { rest: all };
@@ -145,6 +146,7 @@ fn run() -> Result<()> {
             let sessions = a.num("--sessions", 20)?;
             let per_session = a.num("--hits", 3)?;
             let pool = a.num("--pool", query::POOL)?;
+            let recent = a.flag("--recent");
             let in_order = a
                 .value("--in-order")?
                 .map(|v| v.parse())
@@ -169,6 +171,7 @@ fn run() -> Result<()> {
                     per_session,
                     in_order,
                     pool,
+                    recent,
                 },
             )?;
             if json {
@@ -198,9 +201,26 @@ fn run() -> Result<()> {
         }
         "page" => {
             let file = a.value("--file")?.context("page needs --file")?;
-            let from = a.offset("--from")?.unwrap_or(0);
+            let path = Path::new(&file);
             let to = a.offset("--to")?;
-            print(&page::page(Path::new(&file), from, to)?)
+            let from = match a.offset("--tail")? {
+                // The last BYTES of the log (as far as `to`).
+                Some(n) => to
+                    .unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+                    .saturating_sub(n),
+                None => a.offset("--from")?.unwrap_or(0),
+            };
+            print(&page::page(path, from, to)?)
+        }
+        "follow" => {
+            let file = a.value("--file")?.context("follow needs --file")?;
+            let from = a.offset("--from")?.context("follow needs --from")?;
+            let wait = a.num("--wait", 20)?.min(120) as u64;
+            print(&page::follow(
+                Path::new(&file),
+                from,
+                std::time::Duration::from_secs(wait),
+            )?)
         }
         "rename" => {
             let file = a.value("--file")?.context("rename needs --file")?;

@@ -218,3 +218,93 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 }
+
+#[derive(Serialize)]
+pub struct Follow {
+    #[serde(flatten)]
+    pub page: Page,
+    /// The log got shorter than `from`: it was rewritten, read it again.
+    pub reset: bool,
+}
+
+/// Waits (up to `wait`) until whole new lines follow `from` (a line start),
+/// then returns them as `page` does; with nothing new, an empty page at `from`.
+/// The chat calls this in a loop, so new messages show as soon as they're
+/// written, without asking again and again.
+pub fn follow(path: &Path, from: u64, wait: std::time::Duration) -> Result<Follow> {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        let size = std::fs::metadata(path)
+            .with_context(|| format!("can't read {}", path.display()))?
+            .len();
+        if size < from {
+            return Ok(Follow {
+                page: Page {
+                    from,
+                    to: from,
+                    size,
+                    lines: vec![],
+                },
+                reset: true,
+            });
+        }
+        if size > from {
+            let p = page(path, from, None)?;
+            // Only a half-written line so far: wait for the rest.
+            if p.to > from {
+                return Ok(Follow {
+                    page: p,
+                    reset: false,
+                });
+            }
+        }
+        if std::time::Instant::now() >= until {
+            return Ok(Follow {
+                page: Page {
+                    from,
+                    to: from,
+                    size,
+                    lines: vec![],
+                },
+                reset: false,
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_new_lines_as_they_come_and_waits_for_whole_ones() {
+        let p =
+            std::env::temp_dir().join(format!("herdr-search-follow-{}.jsonl", std::process::id()));
+        let first = r#"{"type":"user","message":{"content":"one"}}"#;
+        std::fs::write(&p, format!("{first}\n")).unwrap();
+        let end = first.len() as u64 + 1;
+        // Nothing new: an empty page at the same place, after the wait.
+        let f = follow(&p, end, Duration::from_millis(150)).unwrap();
+        assert!(f.page.lines.is_empty() && !f.reset && f.page.to == end);
+        // A half-written line isn't returned...
+        let mut w = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        w.write_all(br#"{"type":"user","mess"#).unwrap();
+        assert!(follow(&p, end, Duration::from_millis(150))
+            .unwrap()
+            .page
+            .lines
+            .is_empty());
+        // ...until it's whole.
+        w.write_all(b"age\":{\"content\":\"two\"}}\n").unwrap();
+        let f = follow(&p, end, Duration::from_millis(150)).unwrap();
+        assert_eq!(f.page.lines.len(), 1);
+        assert_eq!(f.page.lines[0].at, end);
+        // A rewritten (shorter) log says so.
+        std::fs::write(&p, "{}\n").unwrap();
+        assert!(follow(&p, end, Duration::from_millis(50)).unwrap().reset);
+        let _ = std::fs::remove_file(&p);
+    }
+}

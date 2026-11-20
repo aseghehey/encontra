@@ -392,6 +392,8 @@ pub struct Ask<'a> {
     pub in_order: Option<usize>,
     /// Hits looked at before grouping (more finds more sessions, a little slower).
     pub pool: usize,
+    /// Newest matches first (sessions by their newest match), instead of best first.
+    pub recent: bool,
 }
 
 pub fn search(index_dir: &Path, ask: &Ask) -> Result<Answer> {
@@ -422,8 +424,19 @@ pub fn search_index(index: &Index, ask: &Ask, check_files: bool) -> Result<Answe
         let Some(q) = build(&f, &p, mode) else {
             return Ok(answer);
         };
-        let (top, count) =
-            searcher.search(&q, &(TopDocs::with_limit(pool).order_by_score(), Count))?;
+        let (top, count): (Vec<(f32, tantivy::DocAddress)>, usize) = if ask.recent {
+            let (by_time, count) = searcher.search(
+                &q,
+                &(
+                    TopDocs::with_limit(pool)
+                        .order_by_fast_field::<i64>("ts", tantivy::Order::Desc),
+                    Count,
+                ),
+            )?;
+            (by_time.into_iter().map(|(_, a)| (0.0, a)).collect(), count)
+        } else {
+            searcher.search(&q, &(TopDocs::with_limit(pool).order_by_score(), Count))?
+        };
         if count > 0 || !p.phrases.is_empty() || mode == Mode::Fuzzy {
             answer.mode = Some(mode);
             answer.total = count;
@@ -773,6 +786,7 @@ mod tests {
                 per_session: 5,
                 in_order: None,
                 pool: POOL,
+                recent: false,
             },
             false,
         )
@@ -803,6 +817,28 @@ mod tests {
         assert_eq!(h.snippet, "/home/me/specs/API-TRACE.md");
         assert_eq!(ask("trace from:file").sessions.len(), 1);
         assert_eq!(ask("trace from:me").sessions.len(), 0);
+    }
+
+    #[test]
+    fn newest_first_when_asked() {
+        let b = search_index(
+            &sample(),
+            &Ask {
+                q: "the",
+                now: NOW,
+                sessions: 10,
+                per_session: 5,
+                in_order: None,
+                pool: POOL,
+                recent: true,
+            },
+            false,
+        )
+        .unwrap();
+        let sessions: Vec<&str> = b.sessions.iter().map(|s| s.session.as_str()).collect();
+        assert_eq!(sessions, vec!["s2", "s1"], "s2's messages are newer");
+        let ts: Vec<i64> = b.sessions[1].hits.iter().map(|h| h.ts).collect();
+        assert!(ts.windows(2).all(|w| w[0] >= w[1]), "{ts:?}");
     }
 
     #[test]
@@ -849,6 +885,7 @@ mod tests {
                 per_session: 1,
                 in_order: Some(100),
                 pool: POOL,
+                recent: false,
             },
             false,
         )
