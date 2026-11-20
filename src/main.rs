@@ -210,7 +210,7 @@ fn run() -> Result<()> {
                     .saturating_sub(n),
                 None => a.offset("--from")?.unwrap_or(0),
             };
-            print(&page::page(path, from, to)?)
+            print(&page::page(path, from, to, page::Keep::End)?)
         }
         "follow" => {
             let file = a.value("--file")?.context("follow needs --file")?;

@@ -17,6 +17,18 @@ use std::path::Path;
 const MAX_RESULT: usize = 6000;
 /// Never more than this many bytes of a log in one page.
 pub const MAX_SPAN: u64 = 256 * 1024 * 1024;
+/// About this much JSON out at most: Herdr hands a mod at most 8 MiB of a
+/// command's output and cuts the rest without saying so.
+pub const MAX_OUT: usize = 3 * 1024 * 1024;
+
+/// Which lines a page over its output budget keeps.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Keep {
+    /// The last ones: reading back from what's loaded. `from` moves up to the first kept.
+    End,
+    /// The first ones: following a log forward. `to` moves back to just after the last kept.
+    Start,
+}
 
 /// Line types the chat never shows.
 const DROP: &[&str] = &[
@@ -49,7 +61,7 @@ pub struct Page {
 }
 
 /// The lines that start in `[from, to)`, `from` moved forward to a line start.
-pub fn page(path: &Path, from: u64, to: Option<u64>) -> Result<Page> {
+pub fn page(path: &Path, from: u64, to: Option<u64>, keep: Keep) -> Result<Page> {
     let mut f = File::open(path).with_context(|| format!("can't open {}", path.display()))?;
     let size = f.metadata()?.len();
     let to = to.unwrap_or(size).min(size);
@@ -93,7 +105,8 @@ pub fn page(path: &Path, from: u64, to: Option<u64>) -> Result<Page> {
         Some(i) => i + 1,
         None => 0,
     };
-    let mut lines = Vec::new();
+    // Each line with where the next one starts.
+    let mut lines: Vec<(Line, u64)> = Vec::new();
     let mut start = 0usize;
     for (i, &c) in buf[..end].iter().enumerate() {
         if c != b'\n' {
@@ -103,14 +116,43 @@ pub fn page(path: &Path, from: u64, to: Option<u64>) -> Result<Page> {
         let raw = &buf[start..i];
         start = i + 1;
         if let Some(line) = std::str::from_utf8(raw).ok().and_then(slim) {
-            lines.push(Line { at, line });
+            lines.push((Line { at, line }, from + start as u64));
+        }
+    }
+    let mut to = from + end as u64;
+    // Over budget: keep the lines nearest the side asked for, and say how far
+    // the page really reaches, so the next one carries on from there.
+    let cost = |l: &Line| l.line.len() + 32;
+    if lines.iter().map(|(l, _)| cost(l)).sum::<usize>() > MAX_OUT {
+        let mut used = 0usize;
+        match keep {
+            Keep::End => {
+                let mut first = lines.len();
+                while first > 0
+                    && (used + cost(&lines[first - 1].0) <= MAX_OUT || first == lines.len())
+                {
+                    used += cost(&lines[first - 1].0);
+                    first -= 1;
+                }
+                lines.drain(..first);
+                from = lines.first().map_or(to, |(l, _)| l.at);
+            }
+            Keep::Start => {
+                let mut n = 0;
+                while n < lines.len() && (used + cost(&lines[n].0) <= MAX_OUT || n == 0) {
+                    used += cost(&lines[n].0);
+                    n += 1;
+                }
+                lines.truncate(n);
+                to = lines.last().map_or(from, |(_, next)| *next);
+            }
         }
     }
     Ok(Page {
         from,
-        to: from + end as u64,
+        to,
         size,
-        lines,
+        lines: lines.into_iter().map(|(l, _)| l).collect(),
     })
 }
 
@@ -194,7 +236,7 @@ mod tests {
                 .to_string(),
         ];
         let (p, at) = log(&lines);
-        let pg = page(&p, 0, None).unwrap();
+        let pg = page(&p, 0, None, Keep::End).unwrap();
         let got: Vec<u64> = pg.lines.iter().map(|l| l.at).collect();
         assert_eq!(got, vec![at[0], at[2], at[4], at[5]]);
         let tool: Value = serde_json::from_str(&pg.lines[1].line).unwrap();
@@ -210,11 +252,11 @@ mod tests {
         assert_eq!(pg.to, pg.size);
 
         // A start inside a line moves to the next one; the end finishes its line.
-        let mid = page(&p, at[0] + 3, Some(at[5] + 2)).unwrap();
+        let mid = page(&p, at[0] + 3, Some(at[5] + 2), Keep::End).unwrap();
         assert_eq!(mid.from, at[1]);
         assert_eq!(mid.lines.last().unwrap().at, at[5]);
         // A start exactly on a line keeps it.
-        assert_eq!(page(&p, at[4], None).unwrap().lines[0].at, at[4]);
+        assert_eq!(page(&p, at[4], None, Keep::End).unwrap().lines[0].at, at[4]);
         let _ = std::fs::remove_file(&p);
     }
 }
@@ -249,7 +291,7 @@ pub fn follow(path: &Path, from: u64, wait: std::time::Duration) -> Result<Follo
             });
         }
         if size > from {
-            let p = page(path, from, None)?;
+            let p = page(path, from, None, Keep::Start)?;
             // Only a half-written line so far: wait for the rest.
             if p.to > from {
                 return Ok(Follow {
@@ -305,6 +347,47 @@ mod follow_tests {
         // A rewritten (shorter) log says so.
         std::fs::write(&p, "{}\n").unwrap();
         assert!(follow(&p, end, Duration::from_millis(50)).unwrap().reset);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_page_over_budget_keeps_the_side_asked_for_and_says_where_it_ends() {
+        let p =
+            std::env::temp_dir().join(format!("herdr-search-budget-{}.jsonl", std::process::id()));
+        let mut f = File::create(&p).unwrap();
+        let big = "y".repeat(400_000);
+        let mut starts = Vec::new();
+        let mut off = 0u64;
+        for i in 0..20 {
+            let l = format!(
+                r#"{{"type":"assistant","n":{i},"message":{{"content":[{{"type":"text","text":"{big}"}}]}}}}"#
+            );
+            starts.push(off);
+            writeln!(f, "{l}").unwrap();
+            off += l.len() as u64 + 1;
+        }
+        drop(f);
+        let end = page(&p, 0, None, Keep::End).unwrap();
+        assert!(end.lines.len() < 20 && !end.lines.is_empty());
+        assert_eq!(
+            end.lines.last().unwrap().at,
+            starts[19],
+            "the newest lines stay"
+        );
+        assert_eq!(end.from, end.lines[0].at);
+        let start = page(&p, 0, None, Keep::Start).unwrap();
+        assert_eq!(start.lines[0].at, 0, "the oldest lines stay");
+        let next = starts[start.lines.len()];
+        assert_eq!(start.to, next, "the next page starts right after");
+        // Reading on from there gets the rest without gaps.
+        let rest = page(&p, start.to, None, Keep::Start).unwrap();
+        assert_eq!(rest.lines[0].at, next);
         let _ = std::fs::remove_file(&p);
     }
 }
