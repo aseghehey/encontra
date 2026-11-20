@@ -1,23 +1,25 @@
-//! One Claude Code session log line (JSONL) into the searchable pieces it holds.
+//! One Claude Code session log line (JSONL) into the conversation text it holds.
 //!
-//! What counts as a message follows herdr-chat's own reader (`mods/chat/parse.js`),
-//! so search finds what the chat shows: the person's prompts (typed, queued
-//! mid-turn, or slash commands), the agent's replies, and tool calls with their
-//! results. Sub-agent turns, injected context, hook output and the log's own
-//! bookkeeping (API request records, queue operations, attachments) are left out.
+//! Conversation is what's kept: the person's prompts (typed, queued mid-turn,
+//! slash commands, `!` shell commands) and the agent's replies. Besides that,
+//! only the names of files the person attached (`@path`) are kept, so they can
+//! be found by name; never their contents. Everything else is left
+//! out: tool calls and their results, thinking, command output, sub-agent turns,
+//! injected context (system reminders, task notifications), hook output and the
+//! log's own bookkeeping (API request records, queue operations, attachments).
+//!
+//! What counts as a prompt follows herdr-chat's own reader (`mods/chat/parse.js`),
+//! so search finds what the chat shows.
 
 use serde_json::Value;
 use std::sync::OnceLock;
-
-/// Tool inputs and results are cut to this many bytes: enough to find an error
-/// message or a command, without indexing whole files the agent read.
-pub const MAX_TOOL_TEXT: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
-    Tool,
+    /// A file the person attached; the piece's text is its path.
+    Attachment,
 }
 
 impl Role {
@@ -25,7 +27,7 @@ impl Role {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
-            Role::Tool => "tool",
+            Role::Attachment => "attachment",
         }
     }
 }
@@ -45,13 +47,18 @@ pub struct Line {
     pub pieces: Vec<Piece>,
 }
 
-/// Cheap check before parsing: lines that can't hold a message are skipped
-/// without building a JSON tree (most of a long log is bookkeeping).
+/// Cheap check before parsing: lines that can't hold conversation are skipped
+/// without building a JSON tree (most of a long log is bookkeeping and tool
+/// traffic).
 fn may_hold_message(raw: &str) -> bool {
-    raw.contains("\"type\":\"user\"")
-        || raw.contains("\"type\":\"assistant\"")
+    let user = raw.contains("\"type\":\"user\"");
+    if user && raw.contains("\"tool_result\"") && !raw.contains("\"type\":\"text\"") {
+        return false; // a tool result and nothing the person wrote
+    }
+    user || raw.contains("\"type\":\"assistant\"")
         || raw.contains("\"local_command\"")
         || raw.contains("\"queued_command\"")
+        || (raw.contains("\"attachment\"") && raw.contains("\"type\":\"file\""))
 }
 
 pub fn parse_line(raw: &str) -> Option<Line> {
@@ -74,8 +81,7 @@ pub fn parse_line(raw: &str) -> Option<Line> {
             .and_then(parse_iso_millis),
         pieces: Vec::new(),
     };
-    let kind = d.get("type").and_then(Value::as_str).unwrap_or("");
-    match kind {
+    match d.get("type").and_then(Value::as_str).unwrap_or("") {
         "user" => user_line(&d, &mut line.pieces),
         "assistant" => assistant_line(&d, &mut line.pieces),
         "system" => {
@@ -85,7 +91,7 @@ pub fn parse_line(raw: &str) -> Option<Line> {
                 }
             }
         }
-        "attachment" => queued_command(&d, &mut line.pieces),
+        "attachment" => attachment(&d, &mut line.pieces),
         _ => {}
     }
     if line.pieces.is_empty() {
@@ -101,27 +107,16 @@ fn user_line(d: &Value, out: &mut Vec<Piece>) {
             return;
         }
     }
-    let Some(content) = d.pointer("/message/content") else {
-        return;
-    };
-    match content {
-        Value::String(s) => user_text(s, out),
-        Value::Array(blocks) => {
-            let mut texts = Vec::new();
-            for b in blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            texts.push(t);
-                        }
-                    }
-                    Some("tool_result") => {
-                        let t = to_text(b.get("content").unwrap_or(&Value::Null));
-                        push_tool(out, t);
-                    }
-                    _ => {}
-                }
-            }
+    match d.pointer("/message/content") {
+        Some(Value::String(s)) => user_text(s, out),
+        // Text blocks only: tool results ride in the same message but aren't
+        // anything the person wrote.
+        Some(Value::Array(blocks)) => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect();
             if !texts.is_empty() {
                 user_text(&texts.join("\n"), out);
             }
@@ -134,27 +129,13 @@ fn assistant_line(d: &Value, out: &mut Vec<Piece>) {
     let Some(Value::Array(blocks)) = d.pointer("/message/content") else {
         return;
     };
-    let mut text = String::new();
-    for b in blocks {
-        match b.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    if !t.trim().is_empty() {
-                        if !text.is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        text.push_str(t);
-                    }
-                }
-            }
-            Some("tool_use") => {
-                let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let input = b.get("input").map(Value::to_string).unwrap_or_default();
-                push_tool(out, format!("{name} {input}"));
-            }
-            _ => {}
-        }
-    }
+    let text = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .filter(|t| !t.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     if !text.is_empty() {
         out.push(Piece {
             role: Role::Assistant,
@@ -163,12 +144,27 @@ fn assistant_line(d: &Value, out: &mut Vec<Piece>) {
     }
 }
 
-/// Messages sent while the agent was busy are logged as attachments. Only the
+/// Attachment lines that matter: files the person attached, and messages they
+/// sent while the agent was busy (logged as queued commands). Only the
 /// person's own prompts count, not commands or other machines' messages.
-fn queued_command(d: &Value, out: &mut Vec<Piece>) {
+fn attachment(d: &Value, out: &mut Vec<Piece>) {
     let Some(a) = d.get("attachment") else { return };
-    if a.get("type").and_then(Value::as_str) != Some("queued_command") {
-        return;
+    match a.get("type").and_then(Value::as_str) {
+        Some("file") => {
+            if let Some(name) = a
+                .get("filename")
+                .and_then(Value::as_str)
+                .filter(|n| !n.trim().is_empty())
+            {
+                out.push(Piece {
+                    role: Role::Attachment,
+                    text: name.trim().to_owned(),
+                });
+            }
+            return;
+        }
+        Some("queued_command") => {}
+        _ => return,
     }
     let origin = a
         .pointer("/origin/kind")
@@ -199,9 +195,7 @@ struct Patterns {
     reminder: regex::Regex,
     command: regex::Regex,
     args: regex::Regex,
-    local_out: regex::Regex,
     bash_in: regex::Regex,
-    bash_out: regex::Regex,
     wrapped: regex::Regex,
 }
 
@@ -211,20 +205,15 @@ fn patterns() -> &'static Patterns {
         reminder: regex::Regex::new(r"(?s)<system-reminder>.*?</system-reminder>").unwrap(),
         command: regex::Regex::new(r"<command-name>([^<]*)</command-name>").unwrap(),
         args: regex::Regex::new(r"(?s)<command-args>(.*?)</command-args>").unwrap(),
-        local_out: regex::Regex::new(
-            r"(?s)<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>",
-        )
-        .unwrap(),
         bash_in: regex::Regex::new(r"(?s)<bash-input>(.*?)</bash-input>").unwrap(),
-        bash_out: regex::Regex::new(r"(?s)<bash-stdout>(.*?)</bash-stdout>").unwrap(),
         // A whole message that is one tag-wrapped injection (task notifications,
-        // environment context). The regex crate has no backreferences, so the
-        // closing tag is compared by hand.
+        // environment context, command or shell output). The regex crate has no
+        // backreferences, so the closing tag is compared by hand.
         wrapped: regex::Regex::new(r"(?s)^<([a-z_-]+)[^>]*>.*</([a-z_-]+)>$").unwrap(),
     })
 }
 
-/// The person's text as the chat shows it, or nothing for injected content.
+/// The person's text as the chat shows it, or nothing for anything else.
 fn user_text(raw: &str, out: &mut Vec<Piece>) {
     let p = patterns();
     let text = p.reminder.replace_all(raw, "");
@@ -246,25 +235,24 @@ fn user_text(raw: &str, out: &mut Vec<Piece>) {
             text: t,
         });
     }
-    if let Some(c) = p.local_out.captures(text) {
-        return push_tool(out, strip_ansi(c[1].trim()));
-    }
-    if text.starts_with("<local-command-caveat>") || text.starts_with("[Request interrupted") {
-        return;
-    }
     if let Some(c) = p.bash_in.captures(text) {
         return out.push(Piece {
             role: Role::User,
             text: format!("! {}", c[1].trim()),
         });
     }
-    if let Some(c) = p.bash_out.captures(text) {
-        return push_tool(out, strip_ansi(c[1].trim()));
+    if text.starts_with("[Request interrupted") {
+        return;
     }
+    // Command and shell output (<local-command-stdout>, <bash-stdout>), caveats
+    // and other injections are one wrapped block each.
     if let Some(c) = p.wrapped.captures(text) {
         if c[1] == c[2] {
             return;
         }
+    }
+    if text.starts_with("<local-command-") || text.starts_with("<bash-std") {
+        return;
     }
     if !text.is_empty() {
         out.push(Piece {
@@ -272,61 +260,6 @@ fn user_text(raw: &str, out: &mut Vec<Piece>) {
             text: text.to_owned(),
         });
     }
-}
-
-fn push_tool(out: &mut Vec<Piece>, text: String) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    out.push(Piece {
-        role: Role::Tool,
-        text: truncate(text, MAX_TOOL_TEXT).to_owned(),
-    });
-}
-
-/// Anything content-like (a string, `[{text}]`, `{content}`) as plain text.
-fn to_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(a) => a
-            .iter()
-            .map(to_text)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Object(o) => {
-            if let Some(Value::String(t)) = o.get("text") {
-                t.clone()
-            } else if let Some(c) = o.get("content") {
-                to_text(c)
-            } else if let Some(c) = o.get("output") {
-                to_text(c)
-            } else {
-                String::new()
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-/// At most `max` bytes, cut on a character boundary.
-pub fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-fn strip_ansi(s: &str) -> String {
-    static ANSI: OnceLock<regex::Regex> = OnceLock::new();
-    ANSI.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap())
-        .replace_all(s, "")
-        .into_owned()
 }
 
 /// `2026-11-20T03:52:43.697Z` (or with an offset) as Unix milliseconds.
@@ -409,14 +342,19 @@ mod tests {
     fn reminders_are_removed_and_injections_dropped() {
         let raw = r#"{"type":"user","message":{"content":"<system-reminder>noise</system-reminder>\nreal question"}}"#;
         assert_eq!(texts(raw), vec![(Role::User, "real question".into())]);
-        let injected = r#"{"type":"user","message":{"content":"<task-notification><id>1</id></task-notification>"}}"#;
-        assert!(texts(injected).is_empty());
-        let caveat = r#"{"type":"user","message":{"content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#;
-        assert!(texts(caveat).is_empty());
+        for injected in [
+            r#"{"type":"user","message":{"content":"<task-notification><id>1</id></task-notification>"}}"#,
+            r#"{"type":"user","message":{"content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+            r#"{"type":"user","message":{"content":"<local-command-stdout>Set model to Opus</local-command-stdout>"}}"#,
+            r#"{"type":"user","message":{"content":"<bash-stdout>total 48</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#,
+        ] {
+            assert!(texts(injected).is_empty(), "{injected}");
+        }
     }
 
     #[test]
-    fn meta_and_sidechain_lines_are_skipped() {
+    fn meta_sidechain_and_bookkeeping_are_skipped() {
         assert!(texts(r#"{"type":"user","isMeta":true,"message":{"content":"x"}}"#).is_empty());
         assert!(
             texts(r#"{"type":"user","isSidechain":true,"message":{"content":"x"}}"#).is_empty()
@@ -425,36 +363,36 @@ mod tests {
             texts(r#"{"type":"api-request-blob","message":{"role":"user","content":"x"}}"#)
                 .is_empty()
         );
+        assert!(texts(r#"{"type":"attachment","attachment":{"type":"hook_success","content":"queued_command"}}"#).is_empty());
     }
 
     #[test]
-    fn slash_commands_read_as_typed() {
+    fn slash_and_shell_commands_read_as_typed() {
         let raw = r#"{"type":"user","message":{"content":"<command-name>/model</command-name><command-message>model</command-message><command-args>opus</command-args>"}}"#;
         assert_eq!(texts(raw), vec![(Role::User, "/model opus".into())]);
+        let bash = r#"{"type":"user","message":{"content":"<bash-input>git status</bash-input>"}}"#;
+        assert_eq!(texts(bash), vec![(Role::User, "! git status".into())]);
     }
 
     #[test]
-    fn replies_and_tool_calls() {
-        let raw = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Found it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+    fn replies_without_thinking_or_tool_calls() {
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Found it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}},{"type":"text","text":"Fixed."}]}}"#;
         assert_eq!(
             texts(raw),
-            vec![
-                (Role::Tool, r#"Bash {"command":"cargo test"}"#.into()),
-                (Role::Assistant, "Found it.".into())
-            ]
+            vec![(Role::Assistant, "Found it.\n\nFixed.".into())]
         );
+        let only_tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+        assert!(texts(only_tool).is_empty());
     }
 
     #[test]
-    fn tool_results_are_cut() {
-        let long = "e".repeat(MAX_TOOL_TEXT * 2);
-        let raw = format!(
-            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1","content":[{{"type":"text","text":"{long}"}}]}}]}}}}"#
-        );
-        let t = texts(&raw);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].0, Role::Tool);
-        assert_eq!(t[0].1.len(), MAX_TOOL_TEXT);
+    fn tool_results_are_not_conversation() {
+        let plain = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        assert!(texts(plain).is_empty());
+        let nested = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"file contents"}]}]}}"#;
+        assert!(texts(nested).is_empty());
+        let beside = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"text","text":"and also this"}]}}"#;
+        assert_eq!(texts(beside), vec![(Role::User, "and also this".into())]);
     }
 
     #[test]
@@ -466,8 +404,22 @@ mod tests {
         );
         let other = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"agent"}}}"#;
         assert!(texts(other).is_empty());
-        let hook = r#"{"type":"attachment","attachment":{"type":"hook_success","content":"queued_command"}}"#;
-        assert!(texts(hook).is_empty());
+    }
+
+    #[test]
+    fn attached_files_by_name_only() {
+        let file = r#"{"type":"attachment","attachment":{"type":"file","filename":"/tmp/api/API-TRACE.md","displayPath":"API-TRACE.md","content":{"file":{"content":"secret body"}}}}"#;
+        assert_eq!(
+            texts(file),
+            vec![(Role::Attachment, "/tmp/api/API-TRACE.md".into())]
+        );
+        for other in [
+            r#"{"type":"attachment","attachment":{"type":"compact_file_reference","filename":"/tmp/a.md"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"edited_text_file","filename":"/tmp/b.md","snippet":""}}"#,
+            r#"{"type":"attachment","isSidechain":true,"attachment":{"type":"file","filename":"/tmp/c.md"}}"#,
+        ] {
+            assert!(texts(other).is_empty(), "{other}");
+        }
     }
 
     #[test]
@@ -486,11 +438,5 @@ mod tests {
             Some(1_795_146_763_600)
         );
         assert_eq!(parse_iso_millis("nope"), None);
-    }
-
-    #[test]
-    fn truncate_respects_characters() {
-        assert_eq!(truncate("héllo", 2), "h");
-        assert_eq!(truncate("héllo", 3), "hé");
     }
 }

@@ -4,7 +4,7 @@
 //! reads only what was appended since. A file that got shorter (rewritten) is
 //! dropped from the index and read again from the start.
 
-use crate::parse::{self, Role};
+use crate::parse;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,7 +23,9 @@ use tantivy::tokenizer::{
 use tantivy::{doc, Index, IndexWriter, Term};
 
 pub const TOKENIZER: &str = "conv";
-const SCHEMA_VERSION: u32 = 1;
+/// Bumped whenever what's indexed or how changes: an index from another
+/// version is thrown away and built again (old documents would otherwise stay).
+const SCHEMA_VERSION: u32 = 3;
 /// Bytes read from one file per pass, so one huge log can't hold the rest back.
 const CHUNK: u64 = 64 * 1024 * 1024;
 
@@ -38,7 +40,8 @@ pub struct Fields {
     pub ts: Field,
     pub role: Field,
     pub body: Field,
-    pub tools: Field,
+    /// Paths of attached files, found by name at a lower weight than the conversation.
+    pub names: Field,
 }
 
 pub fn schema() -> (Schema, Fields) {
@@ -66,7 +69,7 @@ pub fn schema() -> (Schema, Fields) {
         ts: b.add_i64_field("ts", INDEXED | STORED | FAST),
         role: b.add_text_field("role", STRING | STORED),
         body: b.add_text_field("body", text.clone()),
-        tools: b.add_text_field("tools", text),
+        names: b.add_text_field("names", text),
     };
     (b.build(), f)
 }
@@ -97,7 +100,7 @@ pub fn fields_of(index: &Index) -> Result<Fields> {
         ts: get("ts")?,
         role: get("role")?,
         body: get("body")?,
-        tools: get("tools")?,
+        names: get("names")?,
     })
 }
 
@@ -108,15 +111,37 @@ pub fn open(dir: &Path) -> Result<Index> {
     Ok(index)
 }
 
+/// Opens the index if it was built by this version, else starts a new one.
 fn open_or_create(dir: &Path) -> Result<Index> {
+    let current = load_state(dir).version == SCHEMA_VERSION && state_path(dir).exists();
     if dir.join("meta.json").exists() {
-        return open(dir);
+        if current {
+            return open(dir);
+        }
+        discard(dir)?;
     }
     fs::create_dir_all(dir)?;
+    let _ = fs::remove_file(state_path(dir));
     let (schema, _) = schema();
     let index = Index::create_in_dir(dir, schema)?;
     index.tokenizers().register(TOKENIZER, analyzer());
     Ok(index)
+}
+
+/// Removes an index this program built (and only that: a folder without an
+/// index and our state file is left alone).
+fn discard(dir: &Path) -> Result<()> {
+    if !dir.join("meta.json").exists() {
+        return Ok(());
+    }
+    eprintln!("herdr-search: rebuilding the index for format {SCHEMA_VERSION}");
+    for e in fs::read_dir(dir)?.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -139,7 +164,6 @@ fn load_state(dir: &Path) -> State {
     fs::read(state_path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice::<State>(&b).ok())
-        .filter(|s| s.version == SCHEMA_VERSION)
         .unwrap_or(State {
             version: SCHEMA_VERSION,
             ..Default::default()
@@ -371,10 +395,6 @@ fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u
             let session = line.session.as_deref().unwrap_or(&session_from_name);
             let project = line.cwd.as_deref().unwrap_or(&project_from_dir);
             for p in line.pieces {
-                let (body, tools) = match p.role {
-                    Role::Tool => ("", p.text.as_str()),
-                    _ => (p.text.as_str(), ""),
-                };
                 writer.add_document(doc!(
                     f.session => session,
                     f.file => t.key.as_str(),
@@ -383,8 +403,8 @@ fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u
                     f.offset => at,
                     f.ts => line.ts.unwrap_or(0),
                     f.role => p.role.as_str(),
-                    f.body => body,
-                    f.tools => tools,
+                    f.body => if p.role == parse::Role::Attachment { "" } else { p.text.as_str() },
+                    f.names => if p.role == parse::Role::Attachment { p.text.as_str() } else { "" },
                 ))?;
                 docs += 1;
             }
@@ -416,4 +436,81 @@ pub fn stats(dir: &Path) -> Result<Stats> {
         files: load_state(dir).files.len(),
         bytes_on_disk: bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("herdr-search-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("logs/-w-proj")).unwrap();
+        d
+    }
+
+    fn prompt(text: &str) -> String {
+        format!("{{\"type\":\"user\",\"sessionId\":\"s1\",\"cwd\":\"/w/proj\",\"timestamp\":\"2026-11-20T03:52:43Z\",\"message\":{{\"content\":\"{text}\"}}}}\n")
+    }
+
+    fn opts(d: &Path) -> Options {
+        Options {
+            root: d.join("logs"),
+            index: d.join("index"),
+            subagents: false,
+            threads: 2,
+            budget_secs: None,
+        }
+    }
+
+    #[test]
+    fn reads_each_byte_once_across_runs_and_rebuilds_on_a_new_format() {
+        let d = scratch("incremental");
+        let log = d.join("logs/-w-proj/s1.jsonl");
+        fs::write(&log, prompt("first question") + &prompt("second question")).unwrap();
+
+        let r1 = update(&opts(&d)).unwrap();
+        assert_eq!((r1.changed, r1.docs), (1, 2));
+        assert_eq!(r1.bytes_read, fs::metadata(&log).unwrap().len());
+
+        // A second run (another start of the app, a reboot) reads nothing.
+        let r2 = update(&opts(&d)).unwrap();
+        assert_eq!((r2.changed, r2.docs, r2.bytes_read), (0, 0, 0));
+
+        // A resumed session appends: only the new line is read.
+        let added = prompt("third question");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(added.as_bytes())
+            .unwrap();
+        let r3 = update(&opts(&d)).unwrap();
+        assert_eq!((r3.docs, r3.bytes_read), (1, added.len() as u64));
+        assert_eq!(stats(&d.join("index")).unwrap().docs, 3);
+
+        // A half-written last line waits for the next run.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"{\"type\":\"user\"")
+            .unwrap();
+        assert_eq!(update(&opts(&d)).unwrap().docs, 0);
+
+        // An index from an older format is thrown away and built again, not added to.
+        let state = state_path(&d.join("index"));
+        let old = fs::read_to_string(&state).unwrap().replacen(
+            &format!("\"version\":{SCHEMA_VERSION}"),
+            "\"version\":1",
+            1,
+        );
+        fs::write(&state, old).unwrap();
+        let r4 = update(&opts(&d)).unwrap();
+        assert_eq!(r4.docs, 3);
+        assert_eq!(stats(&d.join("index")).unwrap().docs, 3);
+        let _ = fs::remove_dir_all(&d);
+    }
 }

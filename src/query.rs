@@ -2,7 +2,8 @@
 //!
 //! Plain words must all match (the last one may be a prefix, since it's the one
 //! still being typed); `"quoted words"` match as a phrase; `-word` excludes.
-//! Filters: `in:<part of the project path>`, `from:me|agent|tool`,
+//! Conversation comes first; files the person attached are found by name, at a
+//! lower weight. Filters: `in:<part of the project path>`, `from:me|agent|file`,
 //! `after:`/`before:` (`2026-11-01` or `7d`), `session:<id>`. A filter whose
 //! value can't be understood refuses the whole search instead of being ignored.
 //! A query that finds nothing is tried again with typo tolerance.
@@ -24,8 +25,8 @@ use tantivy::query::{
 use tantivy::schema::{IndexRecordOption, Value};
 use tantivy::{Index, TantivyDocument, Term};
 
-/// How much a match in tool calls and results counts next to one in the conversation.
-const TOOL_WEIGHT: f32 = 0.3;
+/// How much a match in an attached file's name counts next to one in the conversation.
+const ATTACHMENT_WEIGHT: f32 = 0.4;
 /// Hits looked at before grouping by session, unless the caller says otherwise.
 pub const POOL: usize = 3000;
 const SNIPPET_CHARS: usize = 220;
@@ -81,7 +82,7 @@ pub fn parse_query(q: &str, now: i64) -> Result<Parsed, Refused> {
                     p.role = Some(match value {
                         "me" | "user" | "you" => "user",
                         "agent" | "claude" | "assistant" | "ai" => "assistant",
-                        "tool" | "tools" => "tool",
+                        "file" | "files" | "attachment" | "attachments" => "attachment",
                         _ => return Err(Refused(tok.into())),
                     });
                     true
@@ -246,7 +247,7 @@ fn words_query(
 }
 
 pub fn build(f: &Fields, p: &Parsed, mode: Mode) -> Option<Box<dyn Query>> {
-    let text_fields = [(f.body, 1.0), (f.tools, TOOL_WEIGHT)];
+    let text_fields = [(f.body, 1.0), (f.names, ATTACHMENT_WEIGHT)];
     let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let mut any_text = false;
     let mut all_words: Vec<String> = Vec::new();
@@ -294,7 +295,7 @@ pub fn build(f: &Fields, p: &Parsed, mode: Mode) -> Option<Box<dyn Query>> {
     }
     for w in &p.exclude {
         for t in tokens(w) {
-            for field in [f.body, f.tools] {
+            for field in [f.body, f.names] {
                 must.push((
                     Occur::MustNot,
                     Box::new(TermQuery::new(
@@ -452,8 +453,8 @@ pub fn search_index(index: &Index, ask: &Ask, check_files: bool) -> Result<Answe
         let ts = d.get_first(f.ts).and_then(|v| v.as_i64()).unwrap_or(0);
         let offset = d.get_first(f.offset).and_then(|v| v.as_u64()).unwrap_or(0);
         let role = s(f.role);
-        let text = if role == "tool" {
-            s(f.tools)
+        let text = if role == "attachment" {
+            s(f.names)
         } else {
             s(f.body)
         };
@@ -719,9 +720,18 @@ mod tests {
                 "/w/api",
                 30,
                 3000,
-                "tool",
+                "attachment",
                 "",
-                "Bash {\"command\":\"curl localhost:7777/hook\"} connect ECONNREFUSED",
+                "/tmp/api/hook-ECONNREFUSED-notes.md",
+            ),
+            (
+                "s3",
+                "/w/third",
+                10,
+                7000,
+                "attachment",
+                "",
+                "/home/me/specs/API-TRACE.md",
             ),
             (
                 "s2",
@@ -742,9 +752,9 @@ mod tests {
                 "",
             ),
         ];
-        for (s, proj, off, ts, role, body, tools) in rows {
+        for (s, proj, off, ts, role, body, names) in rows {
             w.add_document(doc!(f.session => s, f.file => format!("/{s}.jsonl"), f.project => proj, f.place => proj,
-                f.offset => off, f.ts => ts, f.role => role, f.body => body, f.tools => tools)).unwrap();
+                f.offset => off, f.ts => ts, f.role => role, f.body => body, f.names => names)).unwrap();
         }
         w.commit().unwrap();
         idx
@@ -767,17 +777,29 @@ mod tests {
     }
 
     #[test]
-    fn all_words_must_match_and_conversation_outranks_tools() {
+    fn all_words_must_match_and_conversation_outranks_attachments() {
         let a = ask("hook econnrefused ");
         assert_eq!(a.mode, Some(Mode::Exact));
         assert_eq!(a.sessions.len(), 1);
         let hits = &a.sessions[0].hits;
         assert_eq!(hits[0].role, "user");
-        assert!(hits.iter().any(|h| h.role == "tool"));
+        assert_eq!(hits.last().unwrap().role, "attachment");
         assert!(
             a.sessions[0].hits.iter().all(|h| h.offset != 20),
             "the reply lacks ECONNREFUSED"
         );
+    }
+
+    #[test]
+    fn attachments_by_name() {
+        let a = ask("API-TRACE.md");
+        assert_eq!(a.sessions.len(), 1);
+        assert_eq!(a.sessions[0].session, "s3");
+        let h = &a.sessions[0].hits[0];
+        assert_eq!(h.role, "attachment");
+        assert_eq!(h.snippet, "/home/me/specs/API-TRACE.md");
+        assert_eq!(ask("trace from:file").sessions.len(), 1);
+        assert_eq!(ask("trace from:me").sessions.len(), 0);
     }
 
     #[test]
@@ -800,8 +822,8 @@ mod tests {
         assert_eq!(ask("hook in:other").sessions.len(), 0);
         let mine = ask("hook from:me ");
         assert!(mine.sessions[0].hits.iter().all(|h| h.role == "user"));
-        assert_eq!(ask("notes after:1970-01-01").sessions.len(), 1);
-        assert_eq!(ask("notes before:1970-01-01").sessions.len(), 0);
+        assert_eq!(ask("release notes after:1970-01-01").sessions.len(), 1);
+        assert_eq!(ask("release notes before:1970-01-01").sessions.len(), 0);
         assert_eq!(
             ask("hook -server ").sessions[0]
                 .hits

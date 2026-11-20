@@ -4,13 +4,17 @@
 //!   herdr-search query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] <query>
 //!   herdr-search stats [--index DIR]
 //!
-//! Every command prints one JSON object on stdout.
+//! Every command prints one JSON object on stdout. `query` in a terminal prints
+//! readable results instead (after bringing the index up to date); `--json`
+//! keeps JSON there too.
 
 mod index;
 mod parse;
 mod query;
+mod text;
 
 use anyhow::{bail, Context, Result};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,11 +117,32 @@ fn run() -> Result<()> {
                 .map(|v| v.parse())
                 .transpose()
                 .context("--in-order wants a number")?;
+            let json = a.flag("--json") || !std::io::stdout().is_terminal();
+            let root = a
+                .value("--root")?
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".claude/projects"));
             let q = a.rest.join(" ");
+            if !json {
+                // Someone at a terminal wants what was said a minute ago too.
+                let threads = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .min(8);
+                let opts = index::Options {
+                    root,
+                    index: index_dir.clone(),
+                    subagents: false,
+                    threads,
+                    budget_secs: Some(20),
+                };
+                if let Err(e) = index::update(&opts) {
+                    eprintln!("herdr-search: index not updated: {e:#}");
+                }
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64);
-            print(&query::search(
+            let answer = query::search(
                 &index_dir,
                 &query::Ask {
                     q: &q,
@@ -127,7 +152,13 @@ fn run() -> Result<()> {
                     in_order,
                     pool,
                 },
-            )?)
+            )?;
+            if json {
+                print(&answer)
+            } else {
+                text::print(&answer);
+                Ok(())
+            }
         }
         "stats" => print(&index::stats(&index_dir)?),
         other => bail!("unknown command {other}"),

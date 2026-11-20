@@ -18,19 +18,23 @@ change them.
 
 ## What's indexed
 
-One document per message piece, following the chat's own idea of a message
-(`mods/chat/parse.js`): the person's prompts (typed, queued mid-turn, slash
-commands), the agent's replies, and tool calls and results (cut to 2 KB each,
-weighted lower). Injected context, hook output, sub-agent turns and the log's
-bookkeeping are left out. Sub-agent logs (`<session>/subagents/`) are skipped
-unless `index --subagents`.
+Conversation only: the person's prompts (typed, queued mid-turn, slash
+commands, `!` shell commands) and the agent's replies, following the chat's own
+idea of a message (`mods/chat/parse.js`). Files the person attached (`@path`)
+are indexed by **name only**, at a lower weight, so conversation ranks first.
+Tool calls and results, thinking, command output, injected context, hook output,
+sub-agent turns and the log's bookkeeping are left out. Sub-agent logs
+(`<session>/subagents/`) are skipped unless `index --subagents`.
 
 Each document keeps its session, project folder, time and the **byte offset**
 of its log line, so a hit can be opened at that exact point of a long log.
 
 Logs only grow, so each file's progress is a byte offset: an update reads what
 was appended since, and a file that got shorter is read again from the start.
-A first build goes newest first and commits as it goes; `--budget SECS` stops
+Progress is saved next to the index (`herdr-search-state.json`), so nothing is
+read twice, across runs and reboots. A resumed session appends to its own log,
+so only its new turns are read. An index from another format version is thrown
+away and rebuilt. A first build goes newest first and commits as it goes; `--budget SECS` stops
 starting new files after that long, and the next run carries on.
 
 ## Queries
@@ -38,7 +42,8 @@ starting new files after that long, and the next run carries on.
 - Plain words must all match; the last one may be a prefix (`hook err` finds
   "hook error"). Words next to each other rank higher.
 - `"quoted words"` match as a phrase; `-word` excludes.
-- Filters: `in:<any part of the project path>`, `from:me|agent|tool`,
+- Filters: `in:<any part of the project path>`, `from:me|agent|file` (`file`:
+  attached files only),
   `after:` / `before:` (`2026-11-01`, `7d`, `12h`, `2w`), `session:<id>`.
 - A filter whose value can't be understood (`after:2026-02-30`) refuses the
   search (`"refused": "<token>"`) instead of being ignored.
