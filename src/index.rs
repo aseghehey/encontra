@@ -25,7 +25,7 @@ use tantivy::{doc, Index, IndexWriter, Term};
 pub const TOKENIZER: &str = "conv";
 /// Bumped whenever what's indexed or how changes: an index from another
 /// version is thrown away and built again (old documents would otherwise stay).
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 /// Bytes read from one file per pass, so one huge log can't hold the rest back.
 const CHUNK: u64 = 64 * 1024 * 1024;
 
@@ -170,6 +170,9 @@ pub struct Meta {
     pub project: String,
     /// Claude Code's own title for it, the latest one.
     pub title: Option<String>,
+    /// The name the person gave it (`/rename`), the latest one: shown over `title`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The person's first message, cut to `FIRST_CHARS`.
     pub first: Option<String>,
     pub first_ts: i64,
@@ -192,6 +195,9 @@ impl Meta {
         }
         if let Some(t) = &line.title {
             self.title = Some(t.clone());
+        }
+        if let Some(n) = &line.name {
+            self.name = Some(n.clone());
         }
         if let Some(ts) = line.ts.filter(|&t| t > 0) {
             if self.first_ts == 0 || ts < self.first_ts {

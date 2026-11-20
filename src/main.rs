@@ -4,6 +4,7 @@
 //!   herdr-search query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] [--update] <query>
 //!   herdr-search sessions [--index DIR] [--limit N] [--filter TEXT] [--update]
 //!   herdr-search page --file LOG [--from OFFSET] [--to OFFSET]
+//!   herdr-search rename --file LOG --session ID --name NAME   (a session that isn't running)
 //!   herdr-search stats [--index DIR]
 //!
 //! Every command prints one JSON object on stdout. `query` in a terminal prints
@@ -112,7 +113,7 @@ fn update_quietly(root: &Path, index_dir: &Path) {
 fn run() -> Result<()> {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
-        bail!("usage: herdr-search index|query|sessions|page|stats [options]");
+        bail!("usage: herdr-search index|query|sessions|page|rename|stats [options]");
     }
     let cmd = all.remove(0);
     let mut a = Args { rest: all };
@@ -200,6 +201,19 @@ fn run() -> Result<()> {
             let from = a.offset("--from")?.unwrap_or(0);
             let to = a.offset("--to")?;
             print(&page::page(Path::new(&file), from, to)?)
+        }
+        "rename" => {
+            let file = a.value("--file")?.context("rename needs --file")?;
+            let session = a.value("--session")?.context("rename needs --session")?;
+            let name = a.value("--name")?.context("rename needs --name")?;
+            let root = a.root()?;
+            let claude_dir = root
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".claude"));
+            sessions::rename(Path::new(&file), &session, &name, &claude_dir)?;
+            update_quietly(&root, &index_dir);
+            print(&serde_json::json!({ "ok": true }))
         }
         "stats" => print(&index::stats(&index_dir)?),
         other => bail!("unknown command {other}"),

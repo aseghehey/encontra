@@ -49,6 +49,8 @@ pub struct Line {
     pub pieces: Vec<Piece>,
     /// The session's title, from Claude Code's own `ai-title` lines.
     pub title: Option<String>,
+    /// The name the person gave it (`/rename`), from `custom-title` lines.
+    pub name: Option<String>,
 }
 
 /// Cheap check before parsing: lines that can't hold conversation are skipped
@@ -64,6 +66,7 @@ fn may_hold_message(raw: &str) -> bool {
         || raw.contains("\"queued_command\"")
         || (raw.contains("\"attachment\"") && raw.contains("\"type\":\"file\""))
         || raw.contains("\"ai-title\"")
+        || raw.contains("\"custom-title\"")
 }
 
 pub fn parse_line(raw: &str) -> Option<Line> {
@@ -87,6 +90,7 @@ pub fn parse_line(raw: &str) -> Option<Line> {
             .and_then(parse_iso_millis),
         pieces: Vec::new(),
         title: None,
+        name: None,
     };
     match d.get("type").and_then(Value::as_str).unwrap_or("") {
         "user" => user_line(&d, &mut line.pieces),
@@ -107,9 +111,17 @@ pub fn parse_line(raw: &str) -> Option<Line> {
                 .filter(|t| !t.is_empty())
                 .map(str::to_owned);
         }
+        "custom-title" => {
+            line.name = d
+                .get("customTitle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+        }
         _ => {}
     }
-    if line.pieces.is_empty() && line.title.is_none() {
+    if line.pieces.is_empty() && line.title.is_none() && line.name.is_none() {
         None
     } else {
         Some(line)
@@ -446,6 +458,15 @@ mod tests {
         assert_eq!(l.title.as_deref(), Some("Fix the router task role"));
         assert!(l.pieces.is_empty());
         assert!(parse_line(r#"{"type":"ai-title","aiTitle":""}"#).is_none());
+    }
+
+    #[test]
+    fn names_people_gave() {
+        let l =
+            parse_line(r#"{"type":"custom-title","customTitle":"API router","sessionId":"s1"}"#)
+                .unwrap();
+        assert_eq!(l.name.as_deref(), Some("API router"));
+        assert!(l.title.is_none() && l.pieces.is_empty());
     }
 
     #[test]

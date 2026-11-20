@@ -65,6 +65,7 @@ pub fn list(ask: &Ask) -> Result<List> {
             needle.as_ref().is_none_or(|n| {
                 [
                     Some(&m.project),
+                    m.name.as_ref(),
                     m.title.as_ref(),
                     m.first.as_ref(),
                     Some(&m.session),
@@ -202,4 +203,69 @@ fn tmux_panes() -> HashMap<u32, TmuxPane> {
             Some((pid, TmuxPane { pane, window }))
         })
         .collect()
+}
+
+/// Names a session that isn't running, the way Claude Code's `/rename` does:
+/// a `custom-title` line at the end of its log. A running session is refused:
+/// its own process writes that log (rename it there, with `/rename`).
+pub fn rename(file: &Path, session: &str, name: &str, claude_dir: &Path) -> Result<()> {
+    use anyhow::bail;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("a name is needed");
+    }
+    if file.file_stem().and_then(|s| s.to_str()) != Some(session) {
+        bail!("{} isn't the log of session {session}", file.display());
+    }
+    if live_sessions(claude_dir).contains_key(session) {
+        bail!("session {session} is running: rename it there with /rename");
+    }
+    let mut f = fs::OpenOptions::new().read(true).append(true).open(file)?;
+    // The new line starts on a line of its own.
+    let len = f.metadata()?.len();
+    let mut lead = "";
+    if len > 0 {
+        f.seek(SeekFrom::Start(len - 1))?;
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            lead = "\n";
+        }
+    }
+    let line =
+        serde_json::json!({ "type": "custom-title", "customTitle": name, "sessionId": session });
+    f.write_all(format!("{lead}{line}\n").as_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renaming_appends_what_claude_code_would() {
+        let d = std::env::temp_dir().join(format!("herdr-search-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sessions")).unwrap();
+        let log = d.join("abc.jsonl");
+        fs::write(&log, "{\"type\":\"user\"}").unwrap(); // no newline at the end
+        rename(&log, "abc", " Router work ", &d).unwrap();
+        let text = fs::read_to_string(&log).unwrap();
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "custom-title");
+        assert_eq!(last["customTitle"], "Router work");
+        assert!(text.ends_with('\n'));
+        assert!(rename(&log, "other", "x", &d).is_err());
+        assert!(rename(&log, "abc", "  ", &d).is_err());
+        // A running session (its process is this test) is left to Claude Code.
+        fs::write(
+            d.join("sessions")
+                .join(format!("{}.json", std::process::id())),
+            "{\"sessionId\":\"abc\"}",
+        )
+        .unwrap();
+        assert!(rename(&log, "abc", "y", &d).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
 }
