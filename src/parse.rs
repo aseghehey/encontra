@@ -40,11 +40,15 @@ pub struct Piece {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Line {
+    /// The log line's own id; a copy of the log elsewhere has the same ids.
+    pub uuid: Option<String>,
     pub session: Option<String>,
     pub cwd: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub ts: Option<i64>,
     pub pieces: Vec<Piece>,
+    /// The session's title, from Claude Code's own `ai-title` lines.
+    pub title: Option<String>,
 }
 
 /// Cheap check before parsing: lines that can't hold conversation are skipped
@@ -59,6 +63,7 @@ fn may_hold_message(raw: &str) -> bool {
         || raw.contains("\"local_command\"")
         || raw.contains("\"queued_command\"")
         || (raw.contains("\"attachment\"") && raw.contains("\"type\":\"file\""))
+        || raw.contains("\"ai-title\"")
 }
 
 pub fn parse_line(raw: &str) -> Option<Line> {
@@ -70,6 +75,7 @@ pub fn parse_line(raw: &str) -> Option<Line> {
         return None;
     }
     let mut line = Line {
+        uuid: d.get("uuid").and_then(Value::as_str).map(str::to_owned),
         session: d
             .get("sessionId")
             .and_then(Value::as_str)
@@ -80,6 +86,7 @@ pub fn parse_line(raw: &str) -> Option<Line> {
             .and_then(Value::as_str)
             .and_then(parse_iso_millis),
         pieces: Vec::new(),
+        title: None,
     };
     match d.get("type").and_then(Value::as_str).unwrap_or("") {
         "user" => user_line(&d, &mut line.pieces),
@@ -92,9 +99,17 @@ pub fn parse_line(raw: &str) -> Option<Line> {
             }
         }
         "attachment" => attachment(&d, &mut line.pieces),
+        "ai-title" => {
+            line.title = d
+                .get("aiTitle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+        }
         _ => {}
     }
-    if line.pieces.is_empty() {
+    if line.pieces.is_empty() && line.title.is_none() {
         None
     } else {
         Some(line)
@@ -420,6 +435,17 @@ mod tests {
         ] {
             assert!(texts(other).is_empty(), "{other}");
         }
+    }
+
+    #[test]
+    fn session_titles() {
+        let l = parse_line(
+            r#"{"type":"ai-title","aiTitle":" Fix the router task role ","sessionId":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(l.title.as_deref(), Some("Fix the router task role"));
+        assert!(l.pieces.is_empty());
+        assert!(parse_line(r#"{"type":"ai-title","aiTitle":""}"#).is_none());
     }
 
     #[test]

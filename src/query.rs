@@ -352,6 +352,8 @@ pub fn build(f: &Fields, p: &Parsed, mode: Mode) -> Option<Box<dyn Query>> {
 
 #[derive(Serialize, Debug)]
 pub struct Hit {
+    /// The log the offset is in: a session resumed from another folder has two.
+    pub file: String,
     pub offset: u64,
     pub ts: i64,
     pub role: String,
@@ -460,6 +462,7 @@ pub fn search_index(index: &Index, ask: &Ask, check_files: bool) -> Result<Answe
         };
         let (snippet, highlights) = marks.snippet(&text);
         let hit = Hit {
+            file: file.clone(),
             offset,
             ts,
             role,

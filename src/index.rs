@@ -7,7 +7,7 @@
 use crate::parse;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use tantivy::{doc, Index, IndexWriter, Term};
 pub const TOKENIZER: &str = "conv";
 /// Bumped whenever what's indexed or how changes: an index from another
 /// version is thrown away and built again (old documents would otherwise stay).
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 5;
 /// Bytes read from one file per pass, so one huge log can't hold the rest back.
 const CHUNK: u64 = 64 * 1024 * 1024;
 
@@ -42,6 +42,8 @@ pub struct Fields {
     pub body: Field,
     /// Paths of attached files, found by name at a lower weight than the conversation.
     pub names: Field,
+    /// The log line's id: the same message in a copy of the log is indexed once.
+    pub uuid: Field,
 }
 
 pub fn schema() -> (Schema, Fields) {
@@ -70,6 +72,7 @@ pub fn schema() -> (Schema, Fields) {
         role: b.add_text_field("role", STRING | STORED),
         body: b.add_text_field("body", text.clone()),
         names: b.add_text_field("names", text),
+        uuid: b.add_text_field("uuid", STRING),
     };
     (b.build(), f)
 }
@@ -101,6 +104,7 @@ pub fn fields_of(index: &Index) -> Result<Fields> {
         role: get("role")?,
         body: get("body")?,
         names: get("names")?,
+        uuid: get("uuid")?,
     })
 }
 
@@ -145,22 +149,74 @@ fn discard(dir: &Path) -> Result<()> {
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct State {
-    version: u32,
-    files: BTreeMap<String, FileState>,
+pub(crate) struct State {
+    pub(crate) version: u32,
+    pub(crate) files: BTreeMap<String, FileState>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
-struct FileState {
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub(crate) struct FileState {
     /// Bytes of the file already indexed (always at a line boundary).
-    offset: u64,
+    pub(crate) offset: u64,
+    /// What the session is, gathered while indexing it (for listing sessions
+    /// without reading their logs again).
+    #[serde(default)]
+    pub(crate) meta: Meta,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Meta {
+    pub session: String,
+    pub project: String,
+    /// Claude Code's own title for it, the latest one.
+    pub title: Option<String>,
+    /// The person's first message, cut to `FIRST_CHARS`.
+    pub first: Option<String>,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    /// Messages in it (the person's and the agent's).
+    pub messages: u64,
+}
+
+const FIRST_CHARS: usize = 300;
+
+impl Meta {
+    fn add(&mut self, line: &parse::Line, session: &str, project: &str) {
+        if self.session.is_empty() {
+            self.session = session.to_owned();
+        }
+        // The folder the session started in: `claude --resume` finds a session
+        // only from there. The log folder's name stands in until a line says.
+        if self.project.is_empty() || (line.cwd.is_some() && !self.project.starts_with('/')) {
+            self.project = project.to_owned();
+        }
+        if let Some(t) = &line.title {
+            self.title = Some(t.clone());
+        }
+        if let Some(ts) = line.ts.filter(|&t| t > 0) {
+            if self.first_ts == 0 || ts < self.first_ts {
+                self.first_ts = ts;
+            }
+            self.last_ts = self.last_ts.max(ts);
+        }
+        for p in &line.pieces {
+            match p.role {
+                parse::Role::User | parse::Role::Assistant => self.messages += 1,
+                parse::Role::Attachment => {}
+            }
+            if p.role == parse::Role::User && self.first.is_none() {
+                let one_line: String = p.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                self.first = Some(one_line.chars().take(FIRST_CHARS).collect());
+            }
+        }
+    }
 }
 
 fn state_path(dir: &Path) -> PathBuf {
     dir.join("herdr-search-state.json")
 }
 
-fn load_state(dir: &Path) -> State {
+pub(crate) fn load_state(dir: &Path) -> State {
     fs::read(state_path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice::<State>(&b).ok())
@@ -202,6 +258,7 @@ struct Todo {
     from: u64,
     size: u64,
     rewritten: bool,
+    meta: Meta,
 }
 
 /// Session logs under `root`, newest first. Sub-agent logs live in
@@ -244,7 +301,7 @@ pub fn update(opts: &Options) -> Result<Report> {
     let mut todo = Vec::new();
     for (path, size, _) in &logs {
         let key = path.to_string_lossy().into_owned();
-        let known = state.files.get(&key).copied().unwrap_or_default();
+        let known = state.files.get(&key).cloned().unwrap_or_default();
         if size == &known.offset {
             continue;
         }
@@ -255,6 +312,11 @@ pub fn update(opts: &Options) -> Result<Report> {
             from: if rewritten { 0 } else { known.offset },
             size: *size,
             rewritten,
+            meta: if rewritten {
+                Meta::default()
+            } else {
+                known.meta
+            },
         });
     }
 
@@ -272,9 +334,15 @@ pub fn update(opts: &Options) -> Result<Report> {
     let mut writer: IndexWriter = index
         .writer_with_num_threads(opts.threads.clamp(1, 8), 512 * 1024 * 1024)
         .context("another update holds the index")?;
+    // Messages already indexed, by line id. Claude Code can leave a copy of a
+    // session's log in several project folders; each message counts once.
+    let indexed = Seen {
+        before: indexed_ids(&index, &f)?,
+        now: Mutex::new(HashSet::new()),
+    };
     let docs = AtomicU64::new(0);
     let bytes = AtomicU64::new(0);
-    let done: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+    let done: Mutex<Vec<(String, FileState)>> = Mutex::new(Vec::new());
     let next = AtomicU64::new(0);
     let deadline = opts
         .budget_secs
@@ -300,11 +368,17 @@ pub fn update(opts: &Options) -> Result<Report> {
                     if t.rewritten {
                         writer.delete_term(Term::from_field_text(f.file, &t.key));
                     }
-                    match index_file(&writer, &f, t) {
-                        Ok((n, read, new_offset)) => {
+                    match index_file(&writer, &f, t, &indexed) {
+                        Ok((n, read, new_offset, meta)) => {
                             docs.fetch_add(n, Ordering::Relaxed);
                             bytes.fetch_add(read, Ordering::Relaxed);
-                            done.lock().unwrap().push((t.key.clone(), new_offset));
+                            done.lock().unwrap().push((
+                                t.key.clone(),
+                                FileState {
+                                    offset: new_offset,
+                                    meta,
+                                },
+                            ));
                         }
                         Err(e) => eprintln!("herdr-search: {}: {e:#}", t.path.display()),
                     }
@@ -314,16 +388,16 @@ pub fn update(opts: &Options) -> Result<Report> {
         start = end;
         if committed_at.elapsed().as_secs() >= 20 || start >= todo.len() {
             writer.commit()?;
-            for (k, off) in done.lock().unwrap().drain(..) {
-                state.files.insert(k, FileState { offset: off });
+            for (k, fs) in done.lock().unwrap().drain(..) {
+                state.files.insert(k, fs);
             }
             save_state(&opts.index, &state)?;
             committed_at = Instant::now();
         }
     }
     writer.commit()?;
-    for (k, off) in done.lock().unwrap().drain(..) {
-        state.files.insert(k, FileState { offset: off });
+    for (k, fs) in done.lock().unwrap().drain(..) {
+        state.files.insert(k, fs);
     }
     // Forget logs that are gone (their documents stay until a rebuild; search
     // drops hits whose file no longer exists).
@@ -345,7 +419,46 @@ pub fn update(opts: &Options) -> Result<Report> {
 
 /// Indexes the complete lines of `t.path` from `t.from`. Returns the documents
 /// added, the bytes read and the new offset (just past the last full line).
-fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u64)> {
+/// Line ids in the index when the update started, and those added since.
+struct Seen {
+    before: HashSet<String>,
+    now: Mutex<HashSet<String>>,
+}
+
+impl Seen {
+    /// Whether this line's messages still need indexing (and marks them done).
+    /// A rewritten log's own old documents were just deleted, so only this
+    /// run's ids count against it.
+    fn first(&self, uuid: Option<&str>, rewritten: bool) -> bool {
+        let Some(id) = uuid else { return true };
+        if !rewritten && self.before.contains(id) {
+            return false;
+        }
+        self.now.lock().unwrap().insert(id.to_owned())
+    }
+}
+
+fn indexed_ids(index: &Index, f: &Fields) -> Result<HashSet<String>> {
+    let searcher = index.reader()?.searcher();
+    let mut out = HashSet::new();
+    for seg in searcher.segment_readers() {
+        let inv = seg.inverted_index(f.uuid)?;
+        let mut terms = inv.terms().stream()?;
+        while terms.advance() {
+            if let Ok(s) = std::str::from_utf8(terms.key()) {
+                out.insert(s.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn index_file(
+    writer: &IndexWriter,
+    f: &Fields,
+    t: &Todo,
+    seen: &Seen,
+) -> Result<(u64, u64, u64, Meta)> {
     let mut file = fs::File::open(&t.path)?;
     let session_from_name = t
         .path
@@ -359,6 +472,7 @@ fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut offset = t.from;
+    let mut meta = t.meta.clone();
     let mut docs = 0u64;
     let mut read_total = 0u64;
     let mut buf = Vec::new();
@@ -394,7 +508,11 @@ fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u
             };
             let session = line.session.as_deref().unwrap_or(&session_from_name);
             let project = line.cwd.as_deref().unwrap_or(&project_from_dir);
-            for p in line.pieces {
+            meta.add(&line, session, project);
+            if line.pieces.is_empty() || !seen.first(line.uuid.as_deref(), t.rewritten) {
+                continue;
+            }
+            for p in &line.pieces {
                 writer.add_document(doc!(
                     f.session => session,
                     f.file => t.key.as_str(),
@@ -405,13 +523,14 @@ fn index_file(writer: &IndexWriter, f: &Fields, t: &Todo) -> Result<(u64, u64, u
                     f.role => p.role.as_str(),
                     f.body => if p.role == parse::Role::Attachment { "" } else { p.text.as_str() },
                     f.names => if p.role == parse::Role::Attachment { p.text.as_str() } else { "" },
+                    f.uuid => line.uuid.as_deref().unwrap_or(""),
                 ))?;
                 docs += 1;
             }
         }
         offset += last_nl as u64 + 1;
     }
-    Ok((docs, read_total, offset))
+    Ok((docs, read_total, offset, meta))
 }
 
 #[derive(Serialize)]
@@ -511,6 +630,47 @@ mod tests {
         let r4 = update(&opts(&d)).unwrap();
         assert_eq!(r4.docs, 3);
         assert_eq!(stats(&d.join("index")).unwrap().docs, 3);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_of_a_log_in_another_folder_is_indexed_once() {
+        let d =
+            std::env::temp_dir().join(format!("herdr-search-test-copies-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let line = |uuid: &str, text: &str| {
+            format!("{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"sessionId\":\"s1\",\"cwd\":\"/w\",\"message\":{{\"content\":\"{text}\"}}}}\n")
+        };
+        for dir in ["-w-a", "-w-b"] {
+            fs::create_dir_all(d.join("logs").join(dir)).unwrap();
+            fs::write(
+                d.join("logs").join(dir).join("s1.jsonl"),
+                line("u1", "same question"),
+            )
+            .unwrap();
+        }
+        let opts = Options {
+            root: d.join("logs"),
+            index: d.join("index"),
+            subagents: false,
+            threads: 2,
+            budget_secs: None,
+        };
+        let r = update(&opts).unwrap();
+        assert_eq!((r.changed, r.docs), (2, 1));
+        // The copy goes on with its own messages: those are new.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(d.join("logs/-w-b/s1.jsonl"))
+            .unwrap();
+        std::io::Write::write_all(&mut f, line("u2", "a new one").as_bytes()).unwrap();
+        assert_eq!(update(&opts).unwrap().docs, 1);
+        assert_eq!(stats(&d.join("index")).unwrap().docs, 2);
         let _ = fs::remove_dir_all(&d);
     }
 }
