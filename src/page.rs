@@ -17,8 +17,9 @@ use std::path::Path;
 const MAX_RESULT: usize = 6000;
 /// Never more than this many bytes of a log in one page.
 pub const MAX_SPAN: u64 = 256 * 1024 * 1024;
-/// About this much JSON out at most: Herdr hands a mod at most 8 MiB of a
-/// command's output and cuts the rest without saying so.
+/// About this much JSON out at most, so one answer stays small for whatever
+/// reads it (Herdr, for one, hands a mod at most 8 MiB of a command's output
+/// and cuts the rest without saying so).
 pub const MAX_OUT: usize = 3 * 1024 * 1024;
 
 /// Which lines a page over its output budget keeps.
@@ -205,7 +206,7 @@ mod tests {
 
     fn log(lines: &[String]) -> (std::path::PathBuf, Vec<u64>) {
         let p = std::env::temp_dir().join(format!(
-            "herdr-search-page-{}-{}.jsonl",
+            "encontra-page-{}-{}.jsonl",
             std::process::id(),
             lines.len()
         ));
@@ -324,7 +325,7 @@ mod follow_tests {
     #[test]
     fn returns_new_lines_as_they_come_and_waits_for_whole_ones() {
         let p =
-            std::env::temp_dir().join(format!("herdr-search-follow-{}.jsonl", std::process::id()));
+            std::env::temp_dir().join(format!("encontra-follow-{}.jsonl", std::process::id()));
         let first = r#"{"type":"user","message":{"content":"one"}}"#;
         std::fs::write(&p, format!("{first}\n")).unwrap();
         let end = first.len() as u64 + 1;
@@ -359,7 +360,7 @@ mod budget_tests {
     #[test]
     fn a_page_over_budget_keeps_the_side_asked_for_and_says_where_it_ends() {
         let p =
-            std::env::temp_dir().join(format!("herdr-search-budget-{}.jsonl", std::process::id()));
+            std::env::temp_dir().join(format!("encontra-budget-{}.jsonl", std::process::id()));
         let mut f = File::create(&p).unwrap();
         let big = "y".repeat(400_000);
         let mut starts = Vec::new();

@@ -1,0 +1,16 @@
+{
+  "name": "encontra",
+  "owner": {
+    "name": "Emanuel Aseghehey"
+  },
+  "metadata": {
+    "description": "encontra: search and read past Claude Code conversations"
+  },
+  "plugins": [
+    {
+      "name": "encontra",
+      "source": "./",
+      "description": "Search and read past Claude Code conversations with the encontra CLI"
+    }
+  ]
+}

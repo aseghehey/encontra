@@ -1,13 +1,16 @@
 [package]
-name = "herdr-search"
+name = "encontra"
 version = "0.1.0"
 edition = "2021"
-description = "Full-text search over Claude Code session logs, for herdr-chat"
+description = "Fast full-text search over Claude Code session logs, for people and the programs and agents they use"
+repository = "https://github.com/aseghehey/encontra"
+keywords = ["claude-code", "search", "agents", "cli", "logs"]
+categories = ["command-line-utilities", "development-tools"]
 license = "MIT"
 publish = false
 
 [[bin]]
-name = "herdr-search"
+name = "encontra"
 path = "src/main.rs"
 
 [dependencies]

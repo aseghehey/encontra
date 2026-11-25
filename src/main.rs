@@ -1,12 +1,12 @@
-//! herdr-search: full-text search over Claude Code session logs, for herdr-chat.
+//! encontra: full-text search over Claude Code session logs.
 //!
-//!   herdr-search index [--root DIR] [--index DIR] [--subagents] [--threads N] [--budget SECS]
-//!   herdr-search query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] [--recent] [--update] <query>
-//!   herdr-search sessions [--index DIR] [--limit N] [--filter TEXT] [--update]
-//!   herdr-search page --file LOG [--from OFFSET | --tail BYTES] [--to OFFSET]
-//!   herdr-search follow --file LOG --from OFFSET [--wait SECS]   (new lines, as soon as they're written)
-//!   herdr-search rename --file LOG --session ID --name NAME   (a session that isn't running)
-//!   herdr-search stats [--index DIR]
+//!   encontra index [--root DIR] [--index DIR] [--subagents] [--threads N] [--budget SECS]
+//!   encontra query [--index DIR] [--sessions N] [--hits N] [--pool N] [--in-order N] [--recent] [--update] <query>
+//!   encontra sessions [--index DIR] [--limit N] [--filter TEXT] [--update]
+//!   encontra page --file LOG [--from OFFSET | --tail BYTES] [--to OFFSET]
+//!   encontra follow --file LOG --from OFFSET [--wait SECS]   (new lines, as soon as they're written)
+//!   encontra rename --file LOG --session ID --name NAME   (a session that isn't running)
+//!   encontra stats [--index DIR]
 //!
 //! Every command prints one JSON object on stdout. `query` in a terminal prints
 //! readable results instead (after bringing the index up to date); `--json`
@@ -34,7 +34,7 @@ fn default_index() -> PathBuf {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/share"));
-    data.join("herdr-search/index")
+    data.join("encontra/index")
 }
 
 struct Args {
@@ -107,14 +107,14 @@ fn update_quietly(root: &Path, index_dir: &Path) {
         budget_secs: Some(20),
     };
     if let Err(e) = index::update(&opts) {
-        eprintln!("herdr-search: index not updated: {e:#}");
+        eprintln!("encontra: index not updated: {e:#}");
     }
 }
 
 fn run() -> Result<()> {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
-        bail!("usage: herdr-search index|query|sessions|page|follow|rename|stats [options]");
+        bail!("usage: encontra index|query|sessions|page|follow|rename|stats [options]");
     }
     let cmd = all.remove(0);
     let mut a = Args { rest: all };

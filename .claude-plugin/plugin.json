@@ -1,0 +1,8 @@
+{
+  "name": "encontra",
+  "description": "Search and read past Claude Code conversations with the encontra CLI",
+  "version": "0.1.0",
+  "author": { "name": "Emanuel Aseghehey" },
+  "homepage": "https://github.com/aseghehey/encontra",
+  "license": "MIT"
+}

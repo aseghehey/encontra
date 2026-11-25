@@ -138,7 +138,7 @@ fn discard(dir: &Path) -> Result<()> {
     if !dir.join("meta.json").exists() {
         return Ok(());
     }
-    eprintln!("herdr-search: rebuilding the index for format {SCHEMA_VERSION}");
+    eprintln!("encontra: rebuilding the index for format {SCHEMA_VERSION}");
     for e in fs::read_dir(dir)?.flatten() {
         let p = e.path();
         if p.is_file() {
@@ -219,7 +219,7 @@ impl Meta {
 }
 
 fn state_path(dir: &Path) -> PathBuf {
-    dir.join("herdr-search-state.json")
+    dir.join("encontra-state.json")
 }
 
 pub(crate) fn load_state(dir: &Path) -> State {
@@ -233,7 +233,7 @@ pub(crate) fn load_state(dir: &Path) -> State {
 }
 
 fn save_state(dir: &Path, state: &State) -> Result<()> {
-    let tmp = dir.join("herdr-search-state.json.tmp");
+    let tmp = dir.join("encontra-state.json.tmp");
     fs::write(&tmp, serde_json::to_vec(state)?)?;
     fs::rename(&tmp, state_path(dir))?;
     Ok(())
@@ -386,7 +386,7 @@ pub fn update(opts: &Options) -> Result<Report> {
                                 },
                             ));
                         }
-                        Err(e) => eprintln!("herdr-search: {}: {e:#}", t.path.display()),
+                        Err(e) => eprintln!("encontra: {}: {e:#}", t.path.display()),
                     }
                 });
             }
@@ -570,7 +570,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let d =
-            std::env::temp_dir().join(format!("herdr-search-test-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("encontra-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("logs/-w-proj")).unwrap();
         d
@@ -647,7 +647,7 @@ mod copy_tests {
     #[test]
     fn a_copy_of_a_log_in_another_folder_is_indexed_once() {
         let d =
-            std::env::temp_dir().join(format!("herdr-search-test-copies-{}", std::process::id()));
+            std::env::temp_dir().join(format!("encontra-test-copies-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         let line = |uuid: &str, text: &str| {
             format!("{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"sessionId\":\"s1\",\"cwd\":\"/w\",\"message\":{{\"content\":\"{text}\"}}}}\n")

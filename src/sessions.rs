@@ -1,8 +1,8 @@
 //! Recent sessions, from what indexing already learned about each log, and
 //! whether each one is running right now: Claude Code writes
 //! `~/.claude/sessions/<pid>.json` for every live session. For a running one
-//! we report its process and the processes above it (so the chat can tell
-//! whether a Herdr terminal runs it), and the tmux pane it's in, if any.
+//! we report its process and the processes above it (so a caller can tell
+//! which terminal runs it), and the tmux pane it's in, if any.
 
 use crate::index::{self, Meta};
 use anyhow::Result;
@@ -182,7 +182,7 @@ fn process_parents() -> HashMap<u32, u32> {
 fn tmux_panes() -> HashMap<u32, TmuxPane> {
     // Not a tab: tmux in the C locale (a plain ssh command) prints control
     // characters as `_`. Window names may hold spaces, so a word that won't.
-    const SEP: &str = " ::herdr:: ";
+    const SEP: &str = " ::encontra:: ";
     let fmt = format!("#{{pane_pid}}{SEP}#{{session_name}}:#{{window_index}}.#{{pane_index}}{SEP}#{{window_name}}");
     let Ok(o) = Command::new("tmux")
         .args(["list-panes", "-a", "-F", &fmt])
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn renaming_appends_what_claude_code_would() {
-        let d = std::env::temp_dir().join(format!("herdr-search-rename-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("encontra-rename-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sessions")).unwrap();
         let log = d.join("abc.jsonl");

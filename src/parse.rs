@@ -8,8 +8,9 @@
 //! injected context (system reminders, task notifications), hook output and the
 //! log's own bookkeeping (API request records, queue operations, attachments).
 //!
-//! What counts as a prompt follows herdr-chat's own reader (`mods/chat/parse.js`),
-//! so search finds what the chat shows.
+//! What counts as a prompt follows what a chat view of the log shows (the
+//! rules of herdr-chat's reader, `mods/chat/parse.js`, MIT), so search finds
+//! what a person saw.
 
 use serde_json::Value;
 use std::sync::OnceLock;
