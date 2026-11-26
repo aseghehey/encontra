@@ -459,6 +459,13 @@ fn indexed_ids(index: &Index, f: &Fields) -> Result<HashSet<String>> {
     Ok(out)
 }
 
+/// A sub-agent's own log: `<project>/<session>/subagents/agent-<id>.jsonl`.
+pub fn is_subagent_log(path: &Path) -> bool {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "subagents")
+}
+
 fn index_file(
     writer: &IndexWriter,
     f: &Fields,
@@ -477,6 +484,7 @@ fn index_file(
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let sub_agent = is_subagent_log(&t.path);
     let mut offset = t.from;
     let mut meta = t.meta.clone();
     let mut docs = 0u64;
@@ -509,7 +517,7 @@ fn index_file(
             let Ok(raw) = std::str::from_utf8(raw) else {
                 continue;
             };
-            let Some(line) = parse::parse_line(raw) else {
+            let Some(line) = parse::parse_line_in(raw, sub_agent) else {
                 continue;
             };
             let session = line.session.as_deref().unwrap_or(&session_from_name);
@@ -569,8 +577,7 @@ mod tests {
     use std::io::Write;
 
     fn scratch(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("encontra-test-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("encontra-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("logs/-w-proj")).unwrap();
         d
@@ -646,8 +653,7 @@ mod copy_tests {
 
     #[test]
     fn a_copy_of_a_log_in_another_folder_is_indexed_once() {
-        let d =
-            std::env::temp_dir().join(format!("encontra-test-copies-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("encontra-test-copies-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         let line = |uuid: &str, text: &str| {
             format!("{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"sessionId\":\"s1\",\"cwd\":\"/w\",\"message\":{{\"content\":\"{text}\"}}}}\n")

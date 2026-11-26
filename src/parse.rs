@@ -70,12 +70,20 @@ fn may_hold_message(raw: &str) -> bool {
         || raw.contains("\"custom-title\"")
 }
 
+/// A line of a session's own log (side chains left out).
+#[cfg(test)]
 pub fn parse_line(raw: &str) -> Option<Line> {
+    parse_line_in(raw, false)
+}
+
+/// As `parse_line`; `sub_agent`: the line is from a sub-agent's own log,
+/// where every line is a side chain (and is that log's conversation).
+pub fn parse_line_in(raw: &str, sub_agent: bool) -> Option<Line> {
     if !may_hold_message(raw) {
         return None;
     }
     let d: Value = serde_json::from_str(raw).ok()?;
-    if d.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+    if !sub_agent && d.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
     }
     let mut line = Line {

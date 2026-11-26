@@ -152,10 +152,11 @@ starting new files after that long, and the next run carries on.
 Highlights are `[start, end)` offsets into the snippet in UTF-16 code units,
 so JavaScript can slice the snippet string with them directly.
 
-## Build
+## Build and test
 
 ```sh
-cargo test
+cargo test                                                     # unit tests and end-to-end tests of the binary
+cargo fmt --check && cargo clippy --all-targets -- -D warnings # what CI's lint job runs
 cargo build --release                                          # this machine
 cargo zigbuild --release --target x86_64-unknown-linux-musl    # a static Linux binary
 ```

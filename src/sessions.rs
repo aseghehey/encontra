@@ -59,7 +59,7 @@ pub fn list(ask: &Ask) -> Result<List> {
     let mut all: Vec<(String, Meta)> = state
         .files
         .into_iter()
-        .filter(|(_, f)| f.meta.messages > 0)
+        .filter(|(k, f)| f.meta.messages > 0 && !index::is_subagent_log(Path::new(k)))
         .map(|(k, f)| (k, f.meta))
         .filter(|(_, m)| {
             needle.as_ref().is_none_or(|n| {
