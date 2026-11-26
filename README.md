@@ -52,6 +52,10 @@ curl -fsSL https://github.com/aseghehey/encontra/releases/latest/download/encont
 curl -fsSL https://github.com/aseghehey/encontra/releases/latest/download/encontra-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.local/bin
 ```
 
+Each archive has a `.sha256` beside it. The macOS binary isn't notarized: if
+you download it with a browser rather than `curl`, clear the quarantine flag
+once with `xattr -d com.apple.quarantine ~/.local/bin/encontra`.
+
 Or build it:
 
 ```sh
@@ -155,6 +159,13 @@ cargo test
 cargo build --release                                          # this machine
 cargo zigbuild --release --target x86_64-unknown-linux-musl    # a static Linux binary
 ```
+
+## Releasing
+
+Bump `version` in `Cargo.toml` (and `.claude-plugin/plugin.json`), commit, then
+tag and push: `git tag -a v0.2.0 -m "encontra 0.2.0" && git push origin v0.2.0`.
+The Release workflow builds both binaries and publishes them with checksums
+and generated notes.
 
 ## Acknowledgements
 
